@@ -1,0 +1,24 @@
+[project]
+name = "nanorl"
+version = "0.1.0"
+description = "A minimal modern async RL framework for language models, in the spirit of nanoGPT/nanochat."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.45",
+    "datasets>=2.20",
+    "vllm>=0.7",
+    "fastapi",
+    "pydantic>=2",
+    "uvicorn",
+    "requests",
+]
+
+[project.optional-dependencies]
+# enabled with: uv sync --extra wandb
+wandb = ["wandb"]
+
+[tool.uv]
+# nanoRL is a set of scripts, not an installable library.
+package = false

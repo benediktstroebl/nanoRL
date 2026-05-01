@@ -3,6 +3,7 @@
 # starts both, and tears the inference server down when training exits.
 #
 # Usage:
+#   uv sync                                   # one-time: create venv with deps
 #   ./run.sh                                  # 2 train + 2 infer GPUs (default)
 #   ./run.sh --train-gpus 4 --infer-gpus 4    # 8-GPU node, even split
 #   ./run.sh -- --total-steps 5000 --lr 5e-7  # forwards anything after `--` to train.py
@@ -31,7 +32,7 @@ INFER_DEVS=$(seq -s, $TRAIN_GPUS $((TRAIN_GPUS+INFER_GPUS-1)))
 echo "[run] $TRAIN_GPUS train ($TRAIN_DEVS) + $INFER_GPUS infer ($INFER_DEVS) GPUs"
 echo "[run] model=$MODEL"
 
-CUDA_VISIBLE_DEVICES=$INFER_DEVS python serve.py \
+CUDA_VISIBLE_DEVICES=$INFER_DEVS uv run python serve.py \
     --model "$MODEL" --tp $INFER_GPUS --port $PORT &
 SERVE_PID=$!
 trap "echo '[run] stopping serve ($SERVE_PID)'; kill $SERVE_PID 2>/dev/null || true" EXIT
@@ -45,7 +46,7 @@ until curl -sf http://localhost:$PORT/health > /dev/null; do
 done
 echo "[run] serve.py up"
 
-CUDA_VISIBLE_DEVICES=$TRAIN_DEVS torchrun --nproc-per-node=$TRAIN_GPUS train.py \
+CUDA_VISIBLE_DEVICES=$TRAIN_DEVS uv run torchrun --nproc-per-node=$TRAIN_GPUS train.py \
     --model "$MODEL" \
     --infer-url "http://localhost:$PORT" \
     --infer-tp $INFER_GPUS \

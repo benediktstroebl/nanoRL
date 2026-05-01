@@ -32,7 +32,7 @@ nanoRL/
 ├── tasks.py        # GSM8K dataset loader + reward function                         (70)
 ├── eval.py         # pass@k on the test split                                       (81)
 ├── run.sh          # launch both processes, one shell command                       (52)
-├── requirements.txt
+├── pyproject.toml  # deps (managed by uv)
 └── README.md
 ```
 
@@ -87,8 +87,10 @@ rollouts are generated against a stale policy.
 ## How to run
 
 ```bash
-pip install -r requirements.txt
-huggingface-cli login   # if your default model is gated; Qwen2.5-0.5B-Instruct is open
+# One-time setup. Installs uv if you don't have it, then creates .venv with all deps.
+curl -LsSf https://astral.sh/uv/install.sh | sh   # skip if uv is already installed
+uv sync                                            # add --extra wandb for wandb logging
+huggingface-cli login                              # only if your model is gated (Qwen2.5-0.5B-Instruct is open)
 
 # 4 GPUs total: 2 trainer + 2 inference, default model (Qwen2.5-0.5B-Instruct), GSM8K.
 ./run.sh
@@ -97,7 +99,7 @@ huggingface-cli login   # if your default model is gated; Qwen2.5-0.5B-Instruct 
 ./run.sh --train-gpus 4 --infer-gpus 4 -- --total-steps 5000 --lr 5e-7
 
 # Eval (after some training; serve.py must still be running):
-python eval.py --task gsm8k --n 200 --k 4
+uv run python eval.py --task gsm8k --n 200 --k 4
 ```
 
 You should see something like:
