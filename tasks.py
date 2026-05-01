@@ -1,68 +1,41 @@
 """
 Tasks for nanoRL.
 
-A task is two functions: a `dataset(split)` that returns a list of
-{messages, answer} dicts and a `reward(response_text, answer)` that
-returns a scalar in [0, 1]. Add a new task by writing both and
-registering them in TASKS at the bottom.
-
-The default task is GSM8K (grade-school math). The model is asked to
-reason step by step and put the final answer in \\boxed{}; the reward
-is 1.0 iff the boxed value matches the ground truth numerically.
+A task is two functions: `dataset(split) -> [{messages, answer}, ...]` and
+`reward(response_text, answer) -> float in [0, 1]`. Add a new task by writing
+both and registering them in TASKS at the bottom. Default is GSM8K, scored by
+extracting the last \\boxed{...} value and matching it to the ground truth.
 """
 import re
 from datasets import load_dataset
 
-# -----------------------------------------------------------------------------
-# Reward functions
-
-# Be liberal: accept \boxed{42}, \boxed{ 42 }, \boxed{42.0}, \boxed{4,200}, etc.
+# Match the *last* \boxed{...}; accept commas / $ in the value.
 BOXED_RE = re.compile(r"\\boxed\{([^{}]*)\}")
 
-def _extract_boxed(text):
-    """Return the *last* \\boxed{...} content, or None."""
-    m = BOXED_RE.findall(text)
-    return m[-1].strip() if m else None
-
 def gsm8k_reward(response, answer):
-    pred = _extract_boxed(response)
-    if pred is None:
+    m = BOXED_RE.findall(response)
+    if not m:
         return 0.0
-    pred = pred.replace(",", "").replace("$", "").strip()
+    pred = m[-1].replace(",", "").replace("$", "").strip()
     try:
         return float(abs(float(pred) - float(answer)) < 1e-4)
     except ValueError:
         return float(pred == answer)
 
-# -----------------------------------------------------------------------------
-# Dataset loaders
-
-GSM8K_SYSTEM = (
-    "You are a careful math assistant. Reason step by step. "
-    "Put your final numeric answer in \\boxed{}."
-)
+GSM8K_SYSTEM = ("You are a careful math assistant. Reason step by step. "
+                "Put your final numeric answer in \\boxed{}.")
 
 def gsm8k_dataset(split="train"):
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    out = []
-    for ex in ds:
-        # GSM8K answers look like "<reasoning>\n#### 42"
-        ans = ex["answer"].split("####")[-1].strip().replace(",", "")
-        out.append({
-            "messages": [
-                {"role": "system", "content": GSM8K_SYSTEM},
-                {"role": "user",   "content": ex["question"]},
-            ],
-            "answer": ans,
-        })
-    return out
+    return [
+        dict(
+            messages=[{"role": "system", "content": GSM8K_SYSTEM},
+                     {"role": "user",   "content": ex["question"]}],
+            answer=ex["answer"].split("####")[-1].strip().replace(",", ""),
+        )
+        for ex in load_dataset("openai/gsm8k", "main", split=split)
+    ]
 
-# -----------------------------------------------------------------------------
-# Registry
-
-TASKS = {
-    "gsm8k": (gsm8k_dataset, gsm8k_reward),
-}
+TASKS = {"gsm8k": (gsm8k_dataset, gsm8k_reward)}
 
 def get_task(name):
     if name not in TASKS:
