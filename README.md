@@ -1,0 +1,156 @@
+# nanoRL
+
+A minimal, modern, async RL framework for language models, in the spirit of
+[nanoGPT](https://github.com/karpathy/nanoGPT) and
+[nanochat](https://github.com/karpathy/nanochat). The whole thing is **four
+Python files, ~820 lines** — and you can read it in 30 minutes.
+
+It does the things modern RL frameworks do:
+
+- **Two processes:** a training process (FSDP2) and an inference process (vLLM).
+- **Async rollouts:** a single background thread fills a bounded queue; the
+  trainer pops batches and never waits on inference until the queue is empty.
+- **Off-policy correction:** the GRPO loss uses a PPO-style importance ratio
+  against the rollout-time logprobs returned by vLLM, so trainer and sampler
+  can drift by `--max-async-steps` steps without bias.
+- **In-place weight sync:** trainer rank 0 forms a side NCCL group with all
+  vLLM workers and broadcasts parameters every step — no checkpoint files,
+  no process restart.
+
+It does *not* do the things that double the line count without changing the
+science: no Ray, no orchestrator process, no ZMQ, no value head, no reference
+model, no KL by default, no LoRA, no multi-turn agent loop, no checkpoint
+conversion pipeline. This is a single-node tool for short-horizon RL on math
+and similar verifiable tasks.
+
+## The whole thing
+
+```
+nanoRL/
+├── train.py        # trainer process: FSDP + GRPO + rollout queue + weight push    (495)
+├── serve.py        # vLLM server with /generate, /init_weight_sync, /update_weights (170)
+├── tasks.py        # GSM8K dataset loader + reward function                         (70)
+├── eval.py         # pass@k on the test split                                       (81)
+├── run.sh          # launch both processes, one shell command                       (52)
+├── requirements.txt
+└── README.md
+```
+
+## Architecture
+
+```
+                       prompts (HTTP /generate)
+        ┌─────────────────────────────────────────────────┐
+        │     ▼  rollouts (token ids + logprobs)          │
+   ┌────┴───────┐                                  ┌──────┴───────┐
+   │  train.py  │                                  │  serve.py    │
+   │  rank 0    │  ◀───── /update_weights (HTTP) ──┤  vLLM        │
+   │  rank 1    │                                  │  workers     │
+   │  ...       │  ─────  NCCL broadcast  ────────▶│  0..M-1      │
+   │  rank N-1  │                                  │              │
+   └────────────┘                                  └──────────────┘
+       FSDP2                                          continuous
+                                                      batching
+```
+
+- `train.py` is launched with `torchrun --nproc-per-node=N`. All ranks shard
+  the model with FSDP2. **Only rank 0** talks to vLLM (rollouts via HTTP,
+  weights via NCCL). Other ranks just do their share of forward/backward.
+- `serve.py` is a FastAPI server wrapping `vllm.AsyncLLMEngine`. Two custom
+  endpoints (`/init_weight_sync`, `/update_weights`) sit alongside `/generate`.
+  Weight sync is implemented via `worker_extension_cls` — every vLLM worker
+  gets methods that join an NCCL group and `broadcast()`-receive a tensor.
+- `run.sh` partitions GPUs (`CUDA_VISIBLE_DEVICES`), starts vLLM on the
+  inference half, waits for `/health`, then `torchrun`s the trainer on the
+  training half. Killing the trainer kills the server via `trap`.
+
+## Algorithm
+
+GRPO with the minimum modern trimmings.
+
+For each prompt q in a step batch, sample G responses {o_1, ..., o_G} from
+vLLM. Reward each: r_i = reward_fn(text(o_i), answer). Compute advantage as
+
+    A_i = r_i - mean(r_*)              # mean-centered, no std (Dr.GRPO)
+
+Store the rollout-time logprobs from vLLM as `old_logp`. In the trainer,
+forward the full prompt+response to get `new_logp`, then
+
+    ratio = exp(new_logp - old_logp)
+    L_clip = min(ratio * A,  clip(ratio, 1-ε, 1+ε) * A)        # PPO clip
+    loss   = -mean over response tokens of L_clip               # DAPO normalization
+
+That's the whole thing — no value head, no reference model, no KL term by
+default. The PPO clip handles the off-policy correction implicitly when the
+rollouts are generated against a stale policy.
+
+## How to run
+
+```bash
+pip install -r requirements.txt
+huggingface-cli login   # if your default model is gated; Qwen2.5-0.5B-Instruct is open
+
+# 4 GPUs total: 2 trainer + 2 inference, default model (Qwen2.5-0.5B-Instruct), GSM8K.
+./run.sh
+
+# 8 GPUs, 4 trainer + 4 inference, longer run, smaller LR.
+./run.sh --train-gpus 4 --infer-gpus 4 -- --total-steps 5000 --lr 5e-7
+
+# Eval (after some training; serve.py must still be running):
+python eval.py --task gsm8k --n 200 --k 4
+```
+
+You should see something like:
+
+```
+step    1 | loss +0.0021 | reward 0.062 (max 1.00) | kl 0.0000 | clipfrac 0.00 | gnorm 0.21 | qdepth 1 | dt 8.4s
+step   10 | loss -0.0143 | reward 0.158 (max 1.00) | kl 0.0021 | clipfrac 0.02 | gnorm 0.45 | qdepth 1 | dt 7.9s
+step  100 | loss -0.0298 | reward 0.392 (max 1.00) | kl 0.0148 | clipfrac 0.07 | gnorm 0.61 | qdepth 2 | dt 7.6s
+```
+
+`qdepth` is the rollout queue depth at step start: queue full means inference is
+faster than training; queue empty means the trainer is starved. With
+`--max-async-steps 2` (default), rollouts can be at most 2 trainer-steps stale.
+
+## Hacking
+
+**Add a task.** Write `dataset(split) -> [{messages, answer}]` and
+`reward(text, answer) -> float in [0,1]`, register both in `TASKS` in
+`tasks.py`. That's it.
+
+**Add a loss variant.** `grpo_loss` in `train.py` is 25 lines. Want
+asymmetric clip (DAPO)? Replace `(1-eps_low, 1+eps_high)`. Want a KL term?
+Add `(logp_ref - logp).exp() - (logp_ref - logp) - 1` and load a reference
+model. Want sequence-level normalization (original GRPO)? Replace the global
+mean with a per-sequence mean.
+
+**Switch model.** Pass `--model Qwen/Qwen2.5-7B-Instruct` to `run.sh`. FSDP2
+shards transformer blocks; that's all that changes. (Bump
+`--max-model-len` and lower `--prompts-per-step` until it fits.)
+
+**Multi-turn / tool use.** Out of scope; that's not 900 lines. Look at
+[SkyRL](https://github.com/NovaSky-AI/SkyRL).
+
+## What this is not
+
+This is *not* a production framework. There is no graceful shutdown, no
+checkpoint resumption, no eval during training, no curriculum, no W&B
+dashboard out of the box, no multi-node, no continuous-batching scheduler,
+no LoRA, no quantization, no MoE expert parallelism, no environment
+containers. Adding any of these is a project; the point of this repo is to
+be the smallest thing that you can read end-to-end and that *actually does
+async RL*. If you find yourself adding a feature flag, consider whether it
+belongs in your fork instead.
+
+## References
+
+- [DeepSeekMath / GRPO](https://arxiv.org/abs/2402.03300) — original loss.
+- [Dr.GRPO](https://arxiv.org/abs/2503.20783) — drop the std normalization.
+- [DAPO](https://arxiv.org/abs/2503.14476) — token-level normalization, clip-higher.
+- [vLLM RLHF utils](https://docs.vllm.ai/en/latest/getting_started/examples/rlhf.html)
+  — the `worker_extension_cls` + `StatelessProcessGroup` weight-sync pattern.
+- [nanochat/scripts/chat_rl.py](https://github.com/karpathy/nanochat/blob/master/scripts/chat_rl.py)
+  — synchronous, on-policy ancestor.
+- [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) and
+  [SkyRL](https://github.com/NovaSky-AI/SkyRL) — the production-scale
+  versions of what's in this folder.

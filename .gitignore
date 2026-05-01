@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+out/
+runs/
+wandb/
+.venv/
+venv/
+*.pt
+*.bin
+.DS_Store
