@@ -3,7 +3,7 @@
 A minimal, modern, async RL framework for language models, in the spirit of
 [nanoGPT](https://github.com/karpathy/nanoGPT) and
 [nanochat](https://github.com/karpathy/nanochat). Four Python files,
-**~560 lines** — read it in 30 minutes.
+**~530 lines** — read it in 30 minutes.
 
 It does the things modern RL frameworks do:
 
@@ -28,11 +28,11 @@ math and similar verifiable tasks.
 
 ```
 nanoRL/
-├── train.py        # FSDP trainer + GRPO + rollout queue + weight push  (306)
-├── serve.py        # vLLM server: /generate + weight-sync endpoints     (137)
-├── tasks.py        # GSM8K dataset + reward                              (43)
-├── eval.py         # pass@k on the test split                            (67)
-├── run.sh          # split GPUs, launch both, trap-kill on exit          (52)
+├── train.py        # FSDP trainer + GRPO + rollout queue + weight push  (286)
+├── serve.py        # vLLM server: /generate + weight-sync endpoints     (134)
+├── tasks.py        # GSM8K dataset + reward                              (41)
+├── eval.py         # pass@k on the test split                            (66)
+├── run.sh          # split GPUs, launch both, trap-kill on exit          (53)
 ├── pyproject.toml  # deps (managed by uv)
 └── README.md
 ```

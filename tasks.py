@@ -1,10 +1,8 @@
-"""
-Tasks for nanoRL.
+"""Tasks for nanoRL.
 
-A task is two functions: `dataset(split) -> [{messages, answer}, ...]` and
-`reward(response_text, answer) -> float in [0, 1]`. Add a new task by writing
-both and registering them in TASKS at the bottom. Default is GSM8K, scored by
-extracting the last \\boxed{...} value and matching it to the ground truth.
+A task = `dataset(split) -> [{messages, answer}, ...]` plus
+`reward(text, answer) -> float in [0,1]`, both registered in TASKS below.
+Default is GSM8K, scored by extracting the last \\boxed{...} value.
 """
 import re
 from datasets import load_dataset

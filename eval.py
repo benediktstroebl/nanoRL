@@ -58,9 +58,8 @@ def main():
         pk += float(max(r) > 0)
 
     n = len(data)
-    print(f"task={args.task} split={args.split} n={n} k={args.k}")
-    print(f"  pass@1  = {p1 / n:.3f}")
-    print(f"  pass@{args.k} = {pk / n:.3f}")
+    print(f"task={args.task} split={args.split} n={n}: "
+          f"pass@1 = {p1/n:.3f} | pass@{args.k} = {pk/n:.3f}")
 
 
 if __name__ == "__main__":

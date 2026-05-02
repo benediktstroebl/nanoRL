@@ -26,8 +26,7 @@ from tasks import get_task
 
 SYNC_HOST, SYNC_PORT = "localhost", 29600  # NCCL rendezvous for weight sync
 
-# -----------------------------------------------------------------------------
-# CLI
+# --- CLI -----------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -50,12 +49,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-dir", default="out")
     p.add_argument("--save-interval", type=int, default=0, help="0 = never")
-    p.add_argument("--log-interval", type=int, default=1)
     p.add_argument("--run", default=None, help="wandb run name; disabled if not set")
     return p.parse_args()
 
-# -----------------------------------------------------------------------------
-# Distributed + logging helpers
+# --- distributed + logging helpers --------------------------------------------
 
 def setup_distributed():
     dist.init_process_group("nccl")
@@ -68,40 +65,34 @@ def is_master(): return dist.get_rank() == 0
 def print0(*a, **k):
     if is_master(): print(*a, **k, flush=True)
 
-class _DummyWandb:
-    def log(self, *a, **k): pass
-    def finish(self): pass
+class _Null:  # stub for wandb when --run is unset; any method call is a no-op
+    def __getattr__(self, _): return lambda *a, **k: None
 
 def init_wandb(args):
-    if args.run is None or not is_master(): return _DummyWandb()
+    if args.run is None or not is_master(): return _Null()
     import wandb
     return wandb.init(project="nanoRL", name=args.run, config=vars(args))
 
-# -----------------------------------------------------------------------------
-# FSDP2: shard each transformer block, then the whole module.
+# --- FSDP2: shard each transformer block, then the whole module ---------------
 
 def setup_fsdp(model):
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blk in model.model.layers:  # standard HF transformer convention (Qwen, Llama, ...)
         fully_shard(blk, mp_policy=mp)
     fully_shard(model, mp_policy=mp)
-    return model
+    return model.train()
 
-# -----------------------------------------------------------------------------
-# Weight sync: trainer rank 0 + all vLLM workers form a NCCL group on the side.
+# --- weight sync: trainer rank 0 + vLLM workers form a side NCCL group --------
 
 def _post_async(url, body, timeout=300):
-    """Fire-and-forget POST in a daemon thread; returns an Event the caller waits on."""
+    """POST in a daemon thread; returns Event the caller waits on."""
     done = threading.Event()
-    def go():
-        requests.post(url, json=body, timeout=timeout).raise_for_status()
-        done.set()
+    def go(): requests.post(url, json=body, timeout=timeout).raise_for_status(); done.set()
     threading.Thread(target=go, daemon=True).start()
     return done
 
 def init_weight_sync(infer_url, infer_tp, device):
-    """Forms NCCL group (trainer rank 0 + vLLM workers). Returns the comm, or None
-    on non-master ranks (which only need to participate in the trainer barrier)."""
+    """Forms NCCL group; returns the comm (None on non-master ranks)."""
     if not is_master():
         dist.barrier(); return None
     world = 1 + infer_tp
@@ -115,7 +106,7 @@ def init_weight_sync(infer_url, infer_tp, device):
     return comm
 
 def push_weights(comm, model, infer_url):
-    """Broadcast every parameter to vLLM. comm=None => non-master (just barrier)."""
+    """Broadcast every param to vLLM. comm=None ⇒ non-master (just barrier)."""
     if comm is None:
         dist.barrier(); return
     named = list(model.named_parameters())
@@ -125,11 +116,9 @@ def push_weights(comm, model, infer_url):
     for _, p in named:
         full = p.full_tensor() if hasattr(p, "full_tensor") else p.data
         comm.broadcast(full, src=0, stream=torch.cuda.current_stream())
-        del full
     done.wait(timeout=600); dist.barrier()
 
-# -----------------------------------------------------------------------------
-# GRPO loss: PPO clip on importance ratio = π_θ / π_gen, token-mean over batch.
+# --- GRPO loss: PPO clip on importance ratio = π_θ / π_gen --------------------
 
 def grpo_loss(logits, ids, response_mask, advantages, old_logp, *, clip_eps):
     sl, tg = logits[:, :-1], ids[:, 1:]
@@ -147,25 +136,24 @@ def grpo_loss(logits, ids, response_mask, advantages, old_logp, *, clip_eps):
         clipfrac = (((ratio - 1).abs() > clip_eps).float() * rm).sum() / denom
     return loss, dict(loss=loss.detach(), kl=kl, clipfrac=clipfrac)
 
-# -----------------------------------------------------------------------------
-# Build a padded tensor batch for this rank's slice of the rollouts.
+# --- build a padded tensor batch for this rank's slice of the rollouts --------
 
 def build_batch(batch, tok, rank, world, max_total_len, device):
     B, G = len(batch["prompt_ids"]), len(batch["response_ids"][0])
+    n = (B * G) // world
     rewards = torch.tensor(batch["rewards"], dtype=torch.float)
     advs = (rewards - rewards.mean(-1, keepdim=True)).flatten().tolist()  # Dr.GRPO
 
-    seqs = []
-    for b in range(B):
+    # Build only this rank's slice: tuples of (full_seq, prompt_len, rollout_logp, adv).
+    my = []
+    for k in range(rank * n, (rank + 1) * n):
+        b, g = divmod(k, G)
         plen = len(batch["prompt_ids"][b])
-        for g in range(G):
-            full = (batch["prompt_ids"][b] + batch["response_ids"][b][g])[:max_total_len]
-            rlp = batch["response_logprobs"][b][g][: len(full) - plen]
-            seqs.append((full, plen, rlp, advs[b * G + g]))
+        full = (batch["prompt_ids"][b] + batch["response_ids"][b][g])[:max_total_len]
+        my.append((full, plen,
+                   batch["response_logprobs"][b][g][: len(full) - plen], advs[k]))
 
-    n_per_rank = (B * G) // world
-    my = seqs[rank * n_per_rank : (rank + 1) * n_per_rank]
-    T, n = max(len(s[0]) for s in my), len(my)
+    T = max(len(s[0]) for s in my)
     ids = torch.full((n, T), tok.pad_token_id, dtype=torch.long)
     attn = torch.zeros((n, T), dtype=torch.long)
     rmask = torch.zeros((n, T), dtype=torch.long)
@@ -175,10 +163,9 @@ def build_batch(batch, tok, rank, world, max_total_len, device):
         L = len(full)
         ids[i, :L] = torch.tensor(full); attn[i, :L] = 1
         rmask[i, plen:L] = 1; olp[i, plen:L] = torch.tensor(rlp)
-    return ids.to(device), attn.to(device), rmask.to(device), olp.to(device), A.to(device)
+    return tuple(t.to(device) for t in (ids, attn, rmask, olp, A))
 
-# -----------------------------------------------------------------------------
-# Rollout worker (rank 0 only): sample prompts, generate, score, push to queue.
+# --- rollout worker (rank 0 only): sample, generate, score, enqueue -----------
 
 def rollout_worker(args, tok, train_data, reward_fn, rollout_q):
     rng = random.Random(args.seed + 1)
@@ -202,20 +189,18 @@ def rollout_worker(args, tok, train_data, reward_fn, rollout_q):
         except Exception as e:
             print0(f"[rollout] {type(e).__name__}: {e}; retry in 5s"); time.sleep(5)
 
-# -----------------------------------------------------------------------------
-# Save: gathered HF-compatible state_dict on rank 0. Optimizer not saved.
+# --- save: gathered HF-format state_dict on rank 0 (optimizer not saved) ------
 
 def save_state(model, save_dir, step):
     sd = {n: (p.full_tensor() if hasattr(p, "full_tensor") else p.data).detach().cpu()
-          for n, p in model.named_parameters()}
+          for n, p in model.named_parameters()}  # full_tensor() is a collective; all ranks call
     if is_master():
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, f"step_{step:06d}.pt")
         torch.save(sd, path); print0(f"[save] {path}")
     dist.barrier()
 
-# -----------------------------------------------------------------------------
-# Main
+# --- main ---------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -232,20 +217,17 @@ def main():
     if tok.pad_token_id is None: tok.pad_token_id = tok.eos_token_id
 
     print0(f"loading {args.model}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
-    )
-    model = setup_fsdp(model); model.train()
+    model = setup_fsdp(AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa"))
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
 
     comm = init_weight_sync(args.infer_url, args.infer_tp, device)
-    print0("[weight-sync] established")
     push_weights(comm, model, args.infer_url)
-    print0("[weight-sync] initial push done")
+    print0("[weight-sync] ready")
 
     dataset_fn, reward_fn = get_task(args.task)
-    train_data = dataset_fn("train") if is_master() else None
-    if is_master(): print0(f"[data] {len(train_data)} train examples")
+    train_data = dataset_fn("train")
+    print0(f"[data] {len(train_data)} train examples")
 
     wandb_run = init_wandb(args)
     rollout_q = queue.Queue(maxsize=args.max_async_steps)
@@ -258,11 +240,10 @@ def main():
 
     for step in range(args.total_steps):
         # Fetch + broadcast rollouts.
-        if is_master():
-            batch, qsize = rollout_q.get(), rollout_q.qsize()
-        else:
-            batch, qsize = None, None
-        ob = [batch]; dist.broadcast_object_list(ob, src=0); batch = ob[0]
+        qsize = rollout_q.qsize() if is_master() else 0
+        ob = [rollout_q.get() if is_master() else None]
+        dist.broadcast_object_list(ob, src=0)
+        batch = ob[0]
 
         # Build my slice as tensors.
         ids, attn, rmask, olp, A = build_batch(batch, tok, rank, world, max_total_len, device)
@@ -270,7 +251,7 @@ def main():
         # Forward + backward, optional microbatching.
         optim.zero_grad(set_to_none=True)
         mb = args.microbatch_size or ids.size(0)
-        n_mb = (ids.size(0) + mb - 1) // mb  # ceil-div
+        n_mb = (ids.size(0) + mb - 1) // mb
         agg = dict(loss=0.0, kl=0.0, clipfrac=0.0)
         for ids_, attn_, rm_, olp_, A_ in zip(*(t.split(mb) for t in (ids, attn, rmask, olp, A))):
             out = model(input_ids=ids_, attention_mask=attn_, use_cache=False)
@@ -284,17 +265,15 @@ def main():
         if (step + 1) % args.weight_sync_interval == 0:
             push_weights(comm, model, args.infer_url)
 
-        if (step + 1) % args.log_interval == 0 and is_master():
+        if is_master():
             dt = time.time() - t_last; t_last += dt
             r = torch.tensor(batch["rewards"])
-            m = dict(step=step + 1, **agg, reward_mean=r.mean().item(),
-                     reward_max=r.max().item(), grad_norm=float(gnorm),
-                     qdepth=qsize, dt=dt)
-            print0(f"step {m['step']:5d} | loss {m['loss']:+.4f} | "
-                   f"reward {m['reward_mean']:.3f} (max {m['reward_max']:.2f}) | "
-                   f"kl {m['kl']:.4f} | clipfrac {m['clipfrac']:.3f} | "
-                   f"gnorm {m['grad_norm']:.2f} | qdepth {m['qdepth']} | dt {m['dt']:.1f}s")
-            wandb_run.log(m)
+            rmean, rmax, gn = r.mean().item(), r.max().item(), float(gnorm)
+            print0(f"step {step+1:5d} | loss {agg['loss']:+.4f} | reward {rmean:.3f} (max {rmax:.2f}) | "
+                   f"kl {agg['kl']:.4f} | clipfrac {agg['clipfrac']:.3f} | gnorm {gn:.2f} | "
+                   f"qdepth {qsize} | dt {dt:.1f}s")
+            wandb_run.log(dict(step=step+1, **agg, reward_mean=rmean, reward_max=rmax,
+                               grad_norm=gn, qdepth=qsize, dt=dt))
 
         if args.save_interval and (step + 1) % args.save_interval == 0:
             save_state(model, args.save_dir, step + 1)

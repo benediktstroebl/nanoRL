@@ -26,11 +26,9 @@ from pydantic import BaseModel
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 from vllm.inputs import TokensPrompt
 
-# -----------------------------------------------------------------------------
+# --- worker extension: methods mixed into every vLLM worker ------------------
 
 class NanoRLWorker:
-    """Mixed into every vLLM worker. Adds NCCL weight-receive methods."""
-
     def init_weight_sync(self, master_addr: str, master_port: int, world_size: int):
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.parallel_state import get_world_group
@@ -44,9 +42,8 @@ class NanoRLWorker:
         buf = torch.empty(tuple(shape), dtype=getattr(torch, dtype), device=self.device)
         self._weight_pg.broadcast(buf, src=0, stream=torch.cuda.current_stream())
         self.model_runner.model.load_weights(weights=[(name, buf)])
-        del buf
 
-# -----------------------------------------------------------------------------
+# --- request / response schemas ----------------------------------------------
 
 class GenReq(BaseModel):
     prompts: list[list[int]]
@@ -66,7 +63,7 @@ class InitSyncReq(BaseModel):
 class UpdateWeightsReq(BaseModel):
     manifest: list[tuple[str, str, list[int]]]  # (name, dtype name, shape)
 
-# -----------------------------------------------------------------------------
+# --- entry point -------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
