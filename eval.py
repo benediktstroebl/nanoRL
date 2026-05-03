@@ -1,12 +1,17 @@
 """nanoRL eval. Hits a running serve.py on the test split and reports pass@1
-and pass@k. Run after `./run.sh` has started serve.py — the trainer doesn't
-need to be running.
+and pass@k via the same multi-turn rollout as training. Run after `./run.sh`
+has started serve.py — the trainer doesn't need to be running.
 
     uv run python eval.py --task gsm8k --n 200 --k 4
+    uv run python eval.py --task gsm8k_calc --n 200 --k 4
 """
-import argparse, random
-import requests
+import argparse
+import random
+from concurrent.futures import ThreadPoolExecutor
+
 from transformers import AutoTokenizer
+
+from env import rollout_one
 from tasks import get_task
 
 
@@ -23,7 +28,7 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--infer-url", default="http://localhost:8000")
-    p.add_argument("--batch", type=int, default=32, help="prompts per HTTP call")
+    p.add_argument("--concurrency", type=int, default=32, help="parallel rollouts in flight")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -31,32 +36,30 @@ def parse_args():
 def main():
     args = parse_args()
     tok = AutoTokenizer.from_pretrained(args.model)
-    dataset_fn, reward_fn = get_task(args.task)
+    dataset_fn, env_factory = get_task(args.task)
     data = dataset_fn(args.split)
     random.Random(args.seed).shuffle(data)
     data = data[: args.n]
 
-    prompts = [tok.apply_chat_template(d["messages"], add_generation_prompt=True,
-                                       tokenize=True)[-args.max_prompt_tokens:]
-               for d in data]
+    rollout_kwargs = dict(
+        max_response_tokens=args.max_tokens,
+        temperature=args.temperature, top_p=args.top_p,
+        max_total_len=args.max_prompt_tokens + args.max_tokens,
+    )
 
-    samples = []
-    for i in range(0, len(prompts), args.batch):
-        chunk = prompts[i : i + args.batch]
-        r = requests.post(f"{args.infer_url}/generate", json=dict(
-            prompts=chunk, n=args.k, max_tokens=args.max_tokens,
-            temperature=args.temperature, top_p=args.top_p,
-            stop_token_ids=[tok.eos_token_id] if tok.eos_token_id is not None else None,
-        ), timeout=600).json()
-        samples.extend(r["response_ids"])
-        print(f"  generated {len(samples)}/{len(prompts)}")
+    def k_rewards(sample):
+        return [rollout_one(env_factory(), tok, args.infer_url, sample, **rollout_kwargs)["reward"]
+                for _ in range(args.k)]
 
-    p1 = pk = 0.0
-    for d, s in zip(data, samples):
-        r = [reward_fn(tok.decode(ids), d["answer"]) for ids in s]
-        p1 += r[0]
-        pk += float(max(r) > 0)
+    with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        all_rewards = []
+        for i, rs in enumerate(ex.map(k_rewards, data), 1):
+            all_rewards.append(rs)
+            if i % 10 == 0 or i == len(data):
+                print(f"  {i}/{len(data)}")
 
+    p1 = sum(rs[0] for rs in all_rewards)
+    pk = sum(float(max(rs) > 0) for rs in all_rewards)
     n = len(data)
     print(f"task={args.task} split={args.split} n={n}: "
           f"pass@1 = {p1/n:.3f} | pass@{args.k} = {pk/n:.3f}")

@@ -1,21 +1,21 @@
-"""
-nanoRL inference server. Wraps vLLM with three RL-specific endpoints:
+"""nanoRL inference server. Wraps vLLM with five endpoints:
 
   POST /generate          -> token ids + per-token logprobs (the rollout)
-  POST /init_weight_sync  -> have all vLLM workers join an NCCL group with
-                             the trainer (rank 0 in the group)
+  POST /init_weight_sync  -> have all vLLM workers join an NCCL group with the
+                             trainer (rank 0 in the group)
   POST /update_weights    -> receive each (name, dtype, shape) via broadcast()
-                             and load it into the model in place. The trainer
-                             sends matching params on the same NCCL group.
+                             and load it into the model in place
+  POST /pause             -> stop accepting new /generate requests; wait for any
+                             in-flight ones to drain. Returns once the model is idle
+  POST /resume            -> let /generate accept new requests again
 
-vLLM's `worker_extension_cls` lets us mix new methods into every worker; they
-are dispatched by `engine.collective_rpc(method, args=...)`. SamplingParams
-with `logprobs=1` always returns the chosen token's logprob in the per-step
-dict (top-1 + chosen-if-different).
+The pause/resume endpoints exist to avoid a race during weight sync: per-param
+collective_rpc calls have `await` between them, so without pause vLLM could schedule
+a generation step on a partially-updated model. Trainer wraps push_weights in
+/pause + (broadcast loop) + /resume.
 
 This file is also imported (not run) by every vLLM worker process to resolve
-`worker_extension_cls="serve.NanoRLWorker"`. So only the class lives at module
-scope; engine + app are built inside main().
+`worker_extension_cls="serve.NanoRLWorker"` — only the class lives at module scope.
 """
 import argparse, asyncio, uuid
 
@@ -88,30 +88,51 @@ def main():
     ))
     app = FastAPI()
 
+    # Pause/resume gate. `ready` is set normally; /pause clears it (blocking new
+    # /generate requests), then waits for `active` (in-flight count) to hit zero.
+    ready = asyncio.Event(); ready.set()
+    state = {"active": 0}
+
     @app.get("/health")
     async def health(): return {"ok": True}
 
     @app.post("/generate")
     async def generate(req: GenReq) -> GenResp:
-        sp = SamplingParams(n=req.n, max_tokens=req.max_tokens,
-                            temperature=req.temperature, top_p=req.top_p,
-                            stop_token_ids=req.stop_token_ids, logprobs=1)
-        async def gen_one(pids):
-            last = None
-            async for out in engine.generate(TokensPrompt(prompt_token_ids=pids),
-                                             sp, uuid.uuid4().hex):
-                last = out
-            return last
-        outs = await asyncio.gather(*(gen_one(p) for p in req.prompts))
-        rids, rlps = [], []
-        for o in outs:
-            ids_n, lps_n = [], []
-            for c in o.outputs:
-                tok = list(c.token_ids)
-                ids_n.append(tok)
-                lps_n.append([c.logprobs[t][tid].logprob for t, tid in enumerate(tok)])
-            rids.append(ids_n); rlps.append(lps_n)
-        return GenResp(response_ids=rids, response_logprobs=rlps)
+        await ready.wait()
+        state["active"] += 1
+        try:
+            sp = SamplingParams(n=req.n, max_tokens=req.max_tokens,
+                                temperature=req.temperature, top_p=req.top_p,
+                                stop_token_ids=req.stop_token_ids, logprobs=1)
+            async def gen_one(pids):
+                last = None
+                async for out in engine.generate(TokensPrompt(prompt_token_ids=pids),
+                                                 sp, uuid.uuid4().hex):
+                    last = out
+                return last
+            outs = await asyncio.gather(*(gen_one(p) for p in req.prompts))
+            rids, rlps = [], []
+            for o in outs:
+                ids_n, lps_n = [], []
+                for c in o.outputs:
+                    tok = list(c.token_ids)
+                    ids_n.append(tok)
+                    lps_n.append([c.logprobs[t][tid].logprob for t, tid in enumerate(tok)])
+                rids.append(ids_n); rlps.append(lps_n)
+            return GenResp(response_ids=rids, response_logprobs=rlps)
+        finally:
+            state["active"] -= 1
+
+    @app.post("/pause")
+    async def pause():
+        ready.clear()
+        while state["active"] > 0:
+            await asyncio.sleep(0.01)
+        return {"ok": True}
+
+    @app.post("/resume")
+    async def resume():
+        ready.set(); return {"ok": True}
 
     @app.post("/init_weight_sync")
     async def init_weight_sync(req: InitSyncReq):
@@ -121,8 +142,7 @@ def main():
 
     @app.post("/update_weights")
     async def update_weights(req: UpdateWeightsReq):
-        # One collective_rpc per param ⇒ one NCCL broadcast per param. Trainer is
-        # sending matching params concurrently (see push_weights in train.py).
+        # Trainer has /pause'd before calling this, so the engine is idle.
         for name, dtype, shape in req.manifest:
             await engine.collective_rpc("update_weight", args=(name, dtype, shape))
         return {"ok": True}
